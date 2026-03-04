@@ -494,6 +494,10 @@ async function requestAgentWelcome() {
   const bootstrapPrompt = `Say this greeting exactly in one response, without adding extra text: "${welcomeMessage}"`;
   sendMessage(bootstrapPrompt, { isInternal: true });
   hasRequestedAgentWelcome = true;
+  awaitingWelcomeConfirmation = true;
+  hasTriggeredVirtualTourIntro = false;
+  pendingWelcomeScriptAfterTurn = false;
+  pendingVirtualTourVideo = false;
 }
 
 // Get checkbox elements for RunConfig options
@@ -564,12 +568,27 @@ const INTERRUPTION_KEYWORD = "hey stella";
 const INTERRUPTION_UNLOCK_MS = 6000;
 const WAKE_REPLY_TEXT = "Yes, I'm here! What can I help you with?";
 const ENGLISH_ONLY_NOTICE = "Please use English only.";
+const DEFAULT_YOUTUBE_URL = "https://youtu.be/tkhpVEcBfv0";
+const VIRTUAL_TOUR_INTRO_TEXT = "THere’s a virtual tour of our center! Feel free to explore it to learn more. If you have any questions, just let me know 😊";
 let interruptionUnlockedUntil = 0;
 let isAgentSpeaking = false;
 const KEYWORD_COOLDOWN_MS = 3000;
 let lastKeywordDetectedAt = 0;
 const ENGLISH_NOTICE_COOLDOWN_MS = 4000;
 let lastEnglishOnlyNoticeAt = 0;
+const VIDEO_COMMAND_COOLDOWN_MS = 8000;
+let lastVideoCommandAt = 0;
+const VIDEO_FALLBACK_SUPPRESS_MS = 15000;
+let suppressVideoFallbackUntil = 0;
+let suppressAgentOutputForTurn = false;
+let awaitingWelcomeConfirmation = false;
+let hasTriggeredVirtualTourIntro = false;
+let pendingWelcomeScriptAfterTurn = false;
+let pendingVirtualTourVideo = false;
+let floatingVideoContainer = null;
+let floatingVideoIframe = null;
+let floatingVideoMinimizeButton = null;
+let currentYouTubeWatchUrl = DEFAULT_YOUTUBE_URL;
 let keywordRecognizer = null;
 let keywordRecognizerActive = false;
 
@@ -604,6 +623,189 @@ function normalizeKeywordText(text) {
 
 function hasInterruptionKeyword(text) {
   return normalizeKeywordText(text).includes(INTERRUPTION_KEYWORD);
+}
+
+function extractYouTubeVideoId(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (host.includes("youtu.be")) {
+      return parsed.pathname.replace("/", "").split("/")[0] || null;
+    }
+    if (host.includes("youtube.com")) {
+      const v = parsed.searchParams.get("v");
+      if (v) {
+        return v;
+      }
+      if (parsed.pathname.startsWith("/embed/")) {
+        return parsed.pathname.split("/embed/")[1]?.split("/")[0] || null;
+      }
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function extractFirstYouTubeUrl(text) {
+  const matches = (text || "").match(/https?:\/\/(?:www\.)?(?:youtube\.com\/\S+|youtu\.be\/\S+)/i);
+  return matches ? matches[0] : null;
+}
+
+function isVideoFallbackReply(text) {
+  const normalized = normalizeKeywordText(text);
+  return normalized.includes("cannot play videos")
+    || normalized.includes("cant play videos")
+    || normalized.includes("unable to play videos")
+    || normalized.includes("unable to play video")
+    || normalized.includes("i am unable to play videos")
+    || normalized.includes("i am unable to play video");
+}
+
+function isWelcomeConfirmation(text) {
+  const normalized = normalizeKeywordText(text);
+  if (!normalized) {
+    return false;
+  }
+
+  if (/\b(yes|yeah|yep|yup|sure|ok|okay|ready|affirmative|certainly|of course)\b/.test(normalized)) {
+    return true;
+  }
+  if (normalized.includes("let s begin") || normalized.includes("lets begin")) {
+    return true;
+  }
+  if (normalized.includes("let s start") || normalized.includes("lets start")) {
+    return true;
+  }
+  return normalized === "start" || normalized === "begin";
+}
+
+function startVirtualTourIntro() {
+  const prompt = `Say this sentence exactly in one response, without adding extra text: "${VIRTUAL_TOUR_INTRO_TEXT}"`;
+  sendMessage(prompt, { isInternal: true });
+  pendingVirtualTourVideo = true;
+}
+
+function handleWelcomeConfirmation(text, fromVoice = false) {
+  if (!awaitingWelcomeConfirmation || hasTriggeredVirtualTourIntro) {
+    return false;
+  }
+  if (!isWelcomeConfirmation(text)) {
+    return false;
+  }
+
+  awaitingWelcomeConfirmation = false;
+  hasTriggeredVirtualTourIntro = true;
+
+  if (fromVoice) {
+    // Suppress model response to the raw confirmation turn, then inject scripted intro.
+    suppressAgentOutputForTurn = true;
+    pendingWelcomeScriptAfterTurn = true;
+  } else {
+    startVirtualTourIntro();
+  }
+
+  return true;
+}
+
+function ensureFloatingVideoPlayer() {
+  if (floatingVideoContainer && floatingVideoIframe && floatingVideoMinimizeButton) {
+    return;
+  }
+
+  const player = document.createElement("div");
+  player.className = "floating-video-player";
+  player.id = "floatingVideoPlayer";
+
+  const header = document.createElement("div");
+  header.className = "floating-video-header";
+
+  const title = document.createElement("div");
+  title.className = "floating-video-title";
+  title.textContent = "Virtual Tour";
+
+  const controls = document.createElement("div");
+  controls.className = "floating-video-controls";
+
+  const openButton = document.createElement("button");
+  openButton.type = "button";
+  openButton.className = "floating-video-btn";
+  openButton.textContent = "Open";
+  openButton.addEventListener("click", () => {
+    window.open(currentYouTubeWatchUrl, "_blank", "noopener,noreferrer");
+  });
+
+  const minimizeButton = document.createElement("button");
+  minimizeButton.type = "button";
+  minimizeButton.className = "floating-video-btn";
+  minimizeButton.textContent = "Minimize";
+  minimizeButton.addEventListener("click", () => {
+    const minimized = player.classList.toggle("minimized");
+    minimizeButton.textContent = minimized ? "Expand" : "Minimize";
+  });
+
+  const closeButton = document.createElement("button");
+  closeButton.type = "button";
+  closeButton.className = "floating-video-btn danger";
+  closeButton.textContent = "Close";
+  closeButton.addEventListener("click", () => {
+    player.remove();
+    floatingVideoContainer = null;
+    floatingVideoIframe = null;
+    floatingVideoMinimizeButton = null;
+  });
+
+  controls.appendChild(openButton);
+  controls.appendChild(minimizeButton);
+  controls.appendChild(closeButton);
+  header.appendChild(title);
+  header.appendChild(controls);
+
+  const body = document.createElement("div");
+  body.className = "floating-video-body";
+
+  const iframe = document.createElement("iframe");
+  iframe.className = "floating-video-iframe";
+  iframe.src = "";
+  iframe.title = "YouTube video player";
+  iframe.allow = "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share";
+  iframe.referrerPolicy = "strict-origin-when-cross-origin";
+  iframe.allowFullscreen = true;
+
+  body.appendChild(iframe);
+  player.appendChild(header);
+  player.appendChild(body);
+  document.body.appendChild(player);
+
+  floatingVideoContainer = player;
+  floatingVideoIframe = iframe;
+  floatingVideoMinimizeButton = minimizeButton;
+}
+
+function playYouTubeVideo(videoUrl = DEFAULT_YOUTUBE_URL) {
+  const now = Date.now();
+  if (now - lastVideoCommandAt < VIDEO_COMMAND_COOLDOWN_MS) {
+    return;
+  }
+  lastVideoCommandAt = now;
+  suppressVideoFallbackUntil = now + VIDEO_FALLBACK_SUPPRESS_MS;
+
+  const videoId = extractYouTubeVideoId(videoUrl);
+  if (!videoId) {
+    addSystemMessage("Unable to play video: invalid YouTube link.");
+    return;
+  }
+
+  currentYouTubeWatchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  ensureFloatingVideoPlayer();
+
+  if (!floatingVideoContainer || !floatingVideoIframe || !floatingVideoMinimizeButton) {
+    return;
+  }
+
+  floatingVideoContainer.classList.remove("minimized");
+  floatingVideoMinimizeButton.textContent = "Minimize";
+  floatingVideoIframe.src = `https://www.youtube.com/embed/${videoId}?autoplay=1&rel=0`;
 }
 
 function isEnglishOnlyInput(text) {
@@ -1098,6 +1300,7 @@ function connectWebsocket() {
     if (adkEvent.turnComplete === true) {
       isAgentSpeaking = false;
       interruptionUnlockedUntil = 0;
+      suppressAgentOutputForTurn = false;
       // Remove typing indicator from current message
       if (currentBubbleElement) {
         const textElement = currentBubbleElement.querySelector(".bubble-text");
@@ -1120,6 +1323,15 @@ function connectWebsocket() {
       currentOutputTranscriptionElement = null;
       inputTranscriptionFinished = false; // Reset for next turn
       hasOutputTranscriptionInTurn = false; // Reset for next turn
+
+      if (pendingWelcomeScriptAfterTurn) {
+        pendingWelcomeScriptAfterTurn = false;
+        startVirtualTourIntro();
+      } else if (pendingVirtualTourVideo) {
+        pendingVirtualTourVideo = false;
+        playYouTubeVideo(DEFAULT_YOUTUBE_URL);
+      }
+
       return;
     }
 
@@ -1127,6 +1339,7 @@ function connectWebsocket() {
     if (adkEvent.interrupted === true) {
       isAgentSpeaking = false;
       interruptionUnlockedUntil = 0;
+      suppressAgentOutputForTurn = false;
       // Stop audio playback if it's playing
       if (audioPlayerNode) {
         audioPlayerNode.port.postMessage({ command: "endOfAudio" });
@@ -1176,6 +1389,10 @@ function connectWebsocket() {
       const isFinished = adkEvent.inputTranscription.finished;
 
       if (transcriptionText) {
+        if (isFinished) {
+          handleWelcomeConfirmation(transcriptionText, true);
+        }
+
         if (!isEnglishOnlyInput(transcriptionText)) {
           notifyEnglishOnlyOnce();
           return;
@@ -1237,6 +1454,20 @@ function connectWebsocket() {
       isAgentSpeaking = true;
 
       if (transcriptionText) {
+        if (suppressAgentOutputForTurn) {
+          if (audioPlayerNode) {
+            audioPlayerNode.port.postMessage({ command: "endOfAudio" });
+          }
+          return;
+        }
+
+        if (Date.now() < suppressVideoFallbackUntil && isVideoFallbackReply(transcriptionText)) {
+          if (audioPlayerNode) {
+            audioPlayerNode.port.postMessage({ command: "endOfAudio" });
+          }
+          return;
+        }
+
         // Finalize any active input transcription when server starts responding
         if (currentInputTranscriptionId != null && currentOutputTranscriptionId == null) {
           // This is the first output transcription - finalize input transcription
@@ -1289,6 +1520,13 @@ function connectWebsocket() {
     if (adkEvent.content && adkEvent.content.parts) {
       const parts = adkEvent.content.parts;
 
+      if (suppressAgentOutputForTurn) {
+        if (audioPlayerNode) {
+          audioPlayerNode.port.postMessage({ command: "endOfAudio" });
+        }
+        return;
+      }
+
       // Finalize any active input transcription when server starts responding with content
       if (currentInputTranscriptionId != null && currentMessageId == null && currentOutputTranscriptionId == null) {
         // This is the first content event - finalize input transcription
@@ -1317,6 +1555,18 @@ function connectWebsocket() {
 
         // Handle text
         if (part.text) {
+          if (Date.now() < suppressVideoFallbackUntil && isVideoFallbackReply(part.text)) {
+            if (audioPlayerNode) {
+              audioPlayerNode.port.postMessage({ command: "endOfAudio" });
+            }
+            continue;
+          }
+
+          const youtubeUrlInText = extractFirstYouTubeUrl(part.text);
+          if (youtubeUrlInText) {
+            playYouTubeVideo(youtubeUrlInText);
+          }
+
           // Skip thinking/reasoning text from chat bubbles (shown in event console)
           if (part.thought) {
             continue;
@@ -1448,6 +1698,10 @@ function addSubmitHandler() {
 
       // Clear input
       messageInput.value = "";
+
+      if (handleWelcomeConfirmation(message, false)) {
+        return false;
+      }
 
       // Send message to server
       sendMessage(message);
