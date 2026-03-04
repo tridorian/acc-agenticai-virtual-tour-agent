@@ -350,6 +350,13 @@ if (countryCodeInput && countryCodeDropdown) {
     
     countryCodeDropdown.appendChild(option);
   });
+
+  // Default country code to Singapore.
+  const defaultCountry = COUNTRY_CODES.find(country => country.name === "Singapore");
+  if (defaultCountry) {
+    countryCodeInput.value = `${defaultCountry.flag} ${defaultCountry.code}`;
+    countryCodeHidden.value = defaultCountry.code;
+  }
   
   // Open dropdown on input focus
   countryCodeInput.addEventListener("focus", function() {
@@ -553,6 +560,18 @@ let currentOutputTranscriptionId = null;
 let currentOutputTranscriptionElement = null;
 let inputTranscriptionFinished = false; // Track if input transcription is complete for this turn
 let hasOutputTranscriptionInTurn = false; // Track if output transcription delivered the response
+const INTERRUPTION_KEYWORD = "hey stella";
+const INTERRUPTION_UNLOCK_MS = 6000;
+const WAKE_REPLY_TEXT = "Yes, I'm here! What can I help you with?";
+const ENGLISH_ONLY_NOTICE = "Please use English only.";
+let interruptionUnlockedUntil = 0;
+let isAgentSpeaking = false;
+const KEYWORD_COOLDOWN_MS = 3000;
+let lastKeywordDetectedAt = 0;
+const ENGLISH_NOTICE_COOLDOWN_MS = 4000;
+let lastEnglishOnlyNoticeAt = 0;
+let keywordRecognizer = null;
+let keywordRecognizerActive = false;
 
 // Helper function to clean spaces between CJK characters
 // Removes spaces between Japanese/Chinese/Korean characters while preserving spaces around Latin text
@@ -573,6 +592,114 @@ function cleanCJKSpaces(text) {
     }
     return match;
   });
+}
+
+function normalizeKeywordText(text) {
+  return (text || "")
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function hasInterruptionKeyword(text) {
+  return normalizeKeywordText(text).includes(INTERRUPTION_KEYWORD);
+}
+
+function isEnglishOnlyInput(text) {
+  return !/[^\x00-\x7F]/.test(text || "");
+}
+
+function notifyEnglishOnlyOnce() {
+  const now = Date.now();
+  if (now - lastEnglishOnlyNoticeAt < ENGLISH_NOTICE_COOLDOWN_MS) {
+    return;
+  }
+  lastEnglishOnlyNoticeAt = now;
+  addSystemMessage(ENGLISH_ONLY_NOTICE);
+}
+
+function unlockInterruptionWindow() {
+  const now = Date.now();
+  if (now - lastKeywordDetectedAt < KEYWORD_COOLDOWN_MS) {
+    return;
+  }
+  lastKeywordDetectedAt = now;
+  const wasUnlocked = Date.now() < interruptionUnlockedUntil;
+  interruptionUnlockedUntil = Date.now() + INTERRUPTION_UNLOCK_MS;
+  if (audioPlayerNode) {
+    audioPlayerNode.port.postMessage({ command: "endOfAudio" });
+  }
+  if (websocket && websocket.readyState === WebSocket.OPEN) {
+    const wakeReplyMessage = JSON.stringify({
+      type: "text",
+      text: WAKE_REPLY_TEXT
+    });
+    websocket.send(wakeReplyMessage);
+  }
+  if (!wasUnlocked) {
+    addSystemMessage(`Interruption unlocked for ${Math.floor(INTERRUPTION_UNLOCK_MS / 1000)} seconds`);
+  }
+}
+
+function ensureKeywordRecognizer() {
+  if (keywordRecognizer) {
+    return true;
+  }
+
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    addSystemMessage("Keyword detection is not supported in this browser.");
+    return false;
+  }
+
+  keywordRecognizer = new SpeechRecognition();
+  keywordRecognizer.continuous = true;
+  keywordRecognizer.interimResults = true;
+  keywordRecognizer.lang = "en-US";
+
+  keywordRecognizer.onresult = (event) => {
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const transcript = event.results[i][0] ? event.results[i][0].transcript : "";
+      if (hasInterruptionKeyword(transcript)) {
+        unlockInterruptionWindow();
+      }
+    }
+  };
+
+  keywordRecognizer.onend = () => {
+    if (keywordRecognizerActive) {
+      try {
+        keywordRecognizer.start();
+      } catch (e) {
+        console.warn("Keyword recognizer restart failed:", e);
+      }
+    }
+  };
+
+  keywordRecognizer.onerror = (event) => {
+    const err = event && event.error ? event.error : "unknown";
+    if (err !== "no-speech" && err !== "aborted") {
+      console.warn("Keyword recognizer error:", err);
+    }
+  };
+
+  return true;
+}
+
+function startKeywordRecognizer() {
+  if (!ensureKeywordRecognizer()) {
+    return;
+  }
+  if (keywordRecognizerActive) {
+    return;
+  }
+  keywordRecognizerActive = true;
+  try {
+    keywordRecognizer.start();
+  } catch (e) {
+    console.warn("Keyword recognizer start failed:", e);
+  }
 }
 
 // Console logging functionality
@@ -969,6 +1096,8 @@ function connectWebsocket() {
 
     // Handle turn complete event
     if (adkEvent.turnComplete === true) {
+      isAgentSpeaking = false;
+      interruptionUnlockedUntil = 0;
       // Remove typing indicator from current message
       if (currentBubbleElement) {
         const textElement = currentBubbleElement.querySelector(".bubble-text");
@@ -996,6 +1125,8 @@ function connectWebsocket() {
 
     // Handle interrupted event
     if (adkEvent.interrupted === true) {
+      isAgentSpeaking = false;
+      interruptionUnlockedUntil = 0;
       // Stop audio playback if it's playing
       if (audioPlayerNode) {
         audioPlayerNode.port.postMessage({ command: "endOfAudio" });
@@ -1045,6 +1176,11 @@ function connectWebsocket() {
       const isFinished = adkEvent.inputTranscription.finished;
 
       if (transcriptionText) {
+        if (!isEnglishOnlyInput(transcriptionText)) {
+          notifyEnglishOnlyOnce();
+          return;
+        }
+
         // Ignore late-arriving transcriptions after we've finished for this turn
         if (inputTranscriptionFinished) {
           return;
@@ -1098,6 +1234,7 @@ function connectWebsocket() {
       const transcriptionText = adkEvent.outputTranscription.text;
       const isFinished = adkEvent.outputTranscription.finished;
       hasOutputTranscriptionInTurn = true;
+      isAgentSpeaking = true;
 
       if (transcriptionText) {
         // Finalize any active input transcription when server starts responding
@@ -1173,6 +1310,7 @@ function connectWebsocket() {
           const data = part.inlineData.data;
 
           if (mimeType && mimeType.startsWith("audio/pcm") && audioPlayerNode) {
+            isAgentSpeaking = true;
             audioPlayerNode.port.postMessage(base64ToArray(data));
           }
         }
@@ -1298,6 +1436,11 @@ function addSubmitHandler() {
     e.preventDefault();
     const message = messageInput.value.trim();
     if (message) {
+      if (!isEnglishOnlyInput(message)) {
+        notifyEnglishOnlyOnce();
+        return false;
+      }
+
       // Add user message bubble
       const userBubble = createMessageBubble(message, true, false);
       messagesDiv.appendChild(userBubble);
@@ -1318,6 +1461,11 @@ function addSubmitHandler() {
 function sendMessage(message, options = {}) {
   if (websocket && websocket.readyState == WebSocket.OPEN) {
     const isInternal = options.isInternal === true;
+    if (!isInternal && !isEnglishOnlyInput(message)) {
+      notifyEnglishOnlyOnce();
+      return;
+    }
+
     const jsonMessage = JSON.stringify({
       type: "text",
       text: message
@@ -1596,6 +1744,7 @@ const startAudioButton = document.getElementById("startAudioButton");
 startAudioButton.addEventListener("click", () => {
   startAudioButton.disabled = true;
   startAudio();
+  startKeywordRecognizer();
   is_audio = true;
   addSystemMessage("Audio mode enabled - you can now speak to the agent");
 
@@ -1609,6 +1758,12 @@ startAudioButton.addEventListener("click", () => {
 // Audio recorder handler
 function audioRecorderHandler(pcmData) {
   if (websocket && websocket.readyState === WebSocket.OPEN && is_audio) {
+    const interruptionUnlocked = Date.now() < interruptionUnlockedUntil;
+    const canSend = !isAgentSpeaking || interruptionUnlocked;
+    if (!canSend) {
+      return;
+    }
+
     // Send audio as binary WebSocket frame (more efficient than base64 JSON)
     websocket.send(pcmData);
     console.log("[CLIENT TO AGENT] Sent audio chunk: %s bytes", pcmData.byteLength);
