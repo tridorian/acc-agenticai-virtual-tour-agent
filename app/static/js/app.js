@@ -357,6 +357,7 @@ if (userInfoForm) {
     sessionEndedAt = null;
     isEndingConversation = false;
     hasEndedConversation = false;
+    conversationLog = [];
     
     // Hide the modal
     userInfoModal.classList.add("hidden");
@@ -495,6 +496,8 @@ const QDRANT_VIDEO_SCORE_THRESHOLD = 0.05;
 const RESUME_VIDEO_HINT_TEXT = 'Video paused. Say "Please continue to play the video" to resume.';
 const REGISTRATION_URL = "https://starlearners.com.sg/admission/register-your-interest/";
 const REGISTRATION_PROMPT_TEXT = "Great! You can proceed with registration here to embark on a new journey with us:";
+const TEAM_CONNECT_URL = "https://starlearners.com.sg/contact-us/";
+const TEAM_WHATSAPP_NUMBER = "6562238808"; // Star Learners WhatsApp number (SG format, no +)
 const TOUR_END_QUESTION = "That's the end of the virtual tour! Do you have any questions or anything else you'd like to know?";
 // const VIRTUAL_TOUR_INTRO_TEXT = "Great to hear that! I'll take you on a virtual tour of our center. Feel free to explore and learn more about what we offer. If you have any questions along the way, just let me know 😊";
 const VIRTUAL_TOUR_INTRO_TEXT = "Great to hear that!😊";
@@ -528,6 +531,7 @@ let youtubeEndMonitorInterval = null;
 let keywordRecognizer = null;
 let keywordRecognizerActive = false;
 let pendingVirtualTourFallbackTimer = null;
+let conversationLog = []; // {role: 'user'|'agent', text: string}
 
 // Helper function to clean spaces between CJK characters
 // Removes spaces between Japanese/Chinese/Korean characters while preserving spaces around Latin text
@@ -631,14 +635,33 @@ function extractTimestampFromYouTubeUrl(url) {
 }
 
 function seekYouTubeToTimestamp(timestampSec) {
+  const adjustedSec = Math.max(0, timestampSec - 2);
+
   if (youtubePlayer && typeof youtubePlayer.seekTo === "function") {
-    youtubePlayer.seekTo(timestampSec, true);
-    youtubePlayer.playVideo();
+    youtubePlayer.seekTo(adjustedSec, true);
+    youtubePlayer.pauseVideo();
+    setTimeout(() => {
+      if (youtubePlayer && typeof youtubePlayer.playVideo === "function") {
+        youtubePlayer.playVideo();
+      }
+    }, 1000);
   } else if (floatingVideoIframe && floatingVideoIframe.contentWindow) {
     floatingVideoIframe.contentWindow.postMessage(
-      JSON.stringify({ event: "command", func: "seekTo", args: [timestampSec, true] }),
+      JSON.stringify({ event: "command", func: "seekTo", args: [adjustedSec, true] }),
       "*"
     );
+    floatingVideoIframe.contentWindow.postMessage(
+      JSON.stringify({ event: "command", func: "pauseVideo", args: [] }),
+      "*"
+    );
+    setTimeout(() => {
+      if (floatingVideoIframe && floatingVideoIframe.contentWindow) {
+        floatingVideoIframe.contentWindow.postMessage(
+          JSON.stringify({ event: "command", func: "playVideo", args: [] }),
+          "*"
+        );
+      }
+    }, 1000);
   }
   if (floatingVideoResumeHint) {
     floatingVideoResumeHint.classList.add("hidden");
@@ -715,6 +738,65 @@ function isNoOrSatisfied(text) {
     || normalized.includes("im good")
     || normalized.includes("i am satisfied")
     || normalized.includes("satisfied");
+}
+
+function logConversationMessage(role, text) {
+  if (!text || !text.trim()) return;
+  conversationLog.push({ role, text: text.trim() });
+}
+
+function isUserQuestion(text) {
+  if (!text || text.length < 4) return false;
+  const t = text.toLowerCase().trim();
+  if (t.endsWith("?")) return true;
+  return /^(?:what|where|when|how|why|who|which|is |are |do |does |did |will |would |could |can |is there|are there|do you|does it|have you)\b/.test(t);
+}
+
+function extractTopicLabel(text) {
+  const cleaned = text.trim().replace(/[.!?]+$/, "");
+  const patterns = [
+    /^(?:i (?:want|would like|like|need) to (?:see|know|learn about|find out about|ask about|ask))(?: (?:about|more about))?(?: (?:the|a|an))?\s*(.*)/i,
+    /^(?:i (?:am|'m) (?:interested|curious)(?: in| about))?(?: (?:the|a|an))?\s*(.*)/i,
+    /^(?:can you (?:show|tell) me(?: (?:about|the|a|an))?)\s*(.*)/i,
+    /^(?:tell me (?:about|more about)(?: (?:the|a|an))?)\s*(.*)/i,
+    /^(?:show me(?: (?:the|a|an))?)\s*(.*)/i,
+    /^(?:(?:please )?(?:show|describe|explain)(?: (?:the|a|an))?)\s*(.*)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = cleaned.match(pattern);
+    if (match && match[1] && match[1].trim().length > 2) {
+      const topic = match[1].trim();
+      return topic.charAt(0).toUpperCase() + topic.slice(1);
+    }
+  }
+  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+}
+
+function generateConversationSummary() {
+  const qaPairs = [];
+  const interests = [];
+  const seenTexts = new Set();
+
+  for (let i = 0; i < conversationLog.length; i++) {
+    const entry = conversationLog[i];
+    if (entry.role !== "user") continue;
+    const key = entry.text.toLowerCase();
+    if (seenTexts.has(key)) continue;
+    seenTexts.add(key);
+
+    if (isUserQuestion(entry.text)) {
+      // Find the closest agent reply after this user message
+      const nextAgent = conversationLog.slice(i + 1).find(e => e.role === "agent");
+      qaPairs.push({
+        question: entry.text,
+        answer: nextAgent ? nextAgent.text : null,
+      });
+    } else if (entry.text.length > 4) {
+      interests.push(extractTopicLabel(entry.text));
+    }
+  }
+
+  return { qaPairs, interests };
 }
 
 function clearSuppressAgentOutput() {
@@ -1616,6 +1698,92 @@ function showEndConversationSummary() {
   if (summaryDuration) {
     summaryDuration.textContent = formatDurationLabel(durationMs);
   }
+
+  // Populate interests and questions from conversation log
+  const { qaPairs, interests } = generateConversationSummary();
+
+  const summaryInterestsList = document.getElementById("summaryInterestsList");
+  if (summaryInterestsList) {
+    summaryInterestsList.innerHTML = "";
+    if (interests.length > 0) {
+      interests.forEach(item => {
+        const li = document.createElement("li");
+        li.textContent = item;
+        summaryInterestsList.appendChild(li);
+      });
+    } else {
+      summaryInterestsList.innerHTML = "<li class='summary-empty'>No specific topics recorded.</li>";
+    }
+  }
+
+  const summaryQuestionsList = document.getElementById("summaryQuestionsList");
+  if (summaryQuestionsList) {
+    summaryQuestionsList.innerHTML = "";
+    if (qaPairs.length > 0) {
+      qaPairs.forEach(({ question, answer }) => {
+        const li = document.createElement("li");
+        li.className = "summary-qa-item";
+
+        const qDiv = document.createElement("div");
+        qDiv.className = "summary-qa-question";
+        qDiv.textContent = question;
+
+        li.appendChild(qDiv);
+
+        if (answer) {
+          const aDiv = document.createElement("div");
+          aDiv.className = "summary-qa-answer";
+          const truncated = answer.length > 220 ? answer.slice(0, 220).trimEnd() + "…" : answer;
+          aDiv.textContent = truncated;
+          li.appendChild(aDiv);
+        }
+
+        summaryQuestionsList.appendChild(li);
+      });
+    } else {
+      summaryQuestionsList.innerHTML = "<li class='summary-empty'>No questions recorded.</li>";
+    }
+  }
+
+  // Wire up share button — sends directly to Star Learners team WhatsApp
+  const shareBtn = document.getElementById("summaryShareButton");
+  if (shareBtn) {
+    shareBtn.onclick = () => {
+      const name = userInfo?.fullName || "a visitor";
+      const topicsText = interests.length > 0
+        ? interests.map(t => `  • ${t}`).join("\n")
+        : "  • General virtual tour";
+      const qaText = qaPairs.length > 0
+        ? qaPairs.map(({ question, answer }) => {
+            const a = answer ? `\n    ↳ ${answer.slice(0, 160).trimEnd()}${answer.length > 160 ? "…" : ""}` : "";
+            return `  • ${question}${a}`;
+          }).join("\n")
+        : "  • None";
+      const msg = [
+        `👋 Hi! I'm ${name} and I just completed a virtual tour with STELLA at Star Learners.`,
+        "",
+        `📧 ${userInfo?.emailAddress || ""}`,
+        "",
+        "📌 Topics I explored:",
+        topicsText,
+        "",
+        "❓ My questions:",
+        qaText,
+        "",
+        "I'd love to learn more — please get in touch!",
+      ].join("\n");
+      window.open(`https://wa.me/${TEAM_WHATSAPP_NUMBER}?text=${encodeURIComponent(msg)}`, "_blank", "noopener,noreferrer");
+    };
+  }
+
+  // Wire up connect button
+  const connectBtn = document.getElementById("summaryConnectButton");
+  if (connectBtn) {
+    connectBtn.onclick = () => {
+      window.open(TEAM_CONNECT_URL, "_blank", "noopener,noreferrer");
+    };
+  }
+
   if (endConversationModal) {
     endConversationModal.classList.add("show");
   }
@@ -1966,6 +2134,7 @@ function connectWebsocket() {
             return;
           }
           handleWelcomeConfirmation(transcriptionText, true);
+          logConversationMessage("user", transcriptionText);
 
           if (postTourFollowupActive && isNoOrSatisfied(transcriptionText)) {
             suppressAgentOutputTemporarily(5000);
@@ -2096,6 +2265,7 @@ function connectWebsocket() {
 
         // If transcription is finished, reset the state
         if (isFinished) {
+          logConversationMessage("agent", transcriptionText);
           if (pendingVirtualTourVideo) {
             pendingVirtualTourVideo = false;
             if (pendingVirtualTourFallbackTimer) {
@@ -2320,6 +2490,7 @@ function submitTextMessage() {
 
   // Send to agent
   sendMessage(text);
+  logConversationMessage("user", text);
 
   // Seek video silently in background based on Qdrant results.
   searchQdrantAndSeekVideo(text);
