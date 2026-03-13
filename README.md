@@ -1,6 +1,6 @@
 # Star Learners Bidi Agent
 
-An AI-powered voice assistant for Star Learners childcare centre, built with Google Gemini Live (bidirectional audio), FastAPI, and Weaviate vector search. The assistant — named **Stella** — answers questions about programmes, facilities, fees, and enrolment, and can reference relevant moments in the centre's video tour.
+An AI-powered voice assistant for Star Learners childcare centre, built with Google Gemini Live (bidirectional audio), FastAPI, and Weaviate vector search. The assistant — named **Stella** — conducts a live tour experience, answering questions about programmes, facilities, fees, and enrolment while narrating relevant moments from the centre's video tour.
 
 ---
 
@@ -31,10 +31,11 @@ FastAPI Server (app/main.py)
   │                                  │
   │                                  ▼
   │                       Weaviate Vector DB (GKE)
-  │                    ┌──────────────────────────────┐
-  │                    │  StarLearnersWebsite (text)   │
-  │                    │  StarLearnersFrame  (video)   │
-  │                    └──────────────────────────────┘
+  │                    ┌────────────────────────────┐
+  │                    │  StarLearnersKB             │
+  │                    │  source_type=website        │
+  │                    │  source_type=youtube_frame  │
+  │                    └────────────────────────────┘
   │
   └── REST API  ──► /api/search
 ```
@@ -44,8 +45,7 @@ FastAPI Server (app/main.py)
 | Layer | Technology |
 |---|---|
 | Voice AI | Gemini Live 2.5 Flash (native audio) via Google ADK |
-| Embeddings (text) | `gemini-embedding-001` (Vertex AI) |
-| Embeddings (video frames) | `multimodalembedding@001` (Vertex AI) |
+| Embeddings | `gemini-embedding-2-preview` (text + images, 3072-dim) |
 | Frame captioning | `gemini-2.5-flash` |
 | Vector database | Weaviate on GKE (`weaviate-cluster`, `us-central1`) |
 | Backend | FastAPI + Python |
@@ -77,9 +77,10 @@ star_learners_bidi_agent/
 │   └── static/                     # Frontend (HTML/CSS/JS)
 │
 ├── data/                           # Data ingestion pipeline
-│   ├── build_weaviate_index.py     # Ingest websites + YouTube into Weaviate
+│   ├── build_weaviate_index.py     # 3-phase ETL: extract → embed → upload
 │   ├── query_weaviate.py           # CLI tool to query Weaviate
 │   ├── sources.yaml                # Website URLs and YouTube source
+│   ├── videos/                     # Extracted frames + embedded JSONL files
 │   └── requirements.txt
 │
 ├── cloudbuild.yaml                 # Cloud Build → Cloud Run deployment
@@ -142,7 +143,17 @@ curl http://localhost:8080/v1/meta | python3 -m json.tool | head -10
 
 ## Step 2 — Data Pipeline (Build Knowledge Base)
 
-This step scrapes the Star Learners website and extracts frames from the YouTube tour video, then stores everything in Weaviate with text and image embeddings.
+The pipeline ingests Star Learners website content and YouTube tour video frames into a single unified Weaviate collection (`StarLearnersKB`) using `gemini-embedding-2-preview` for both text and image embeddings.
+
+The pipeline runs in three phases, which can be run all at once or independently:
+
+| Mode | What it does |
+|---|---|
+| `extract-frames` | Download video → extract JPEG frames → write `videos/frames/{video_id}/index.jsonl` |
+| `embed` | Embed website text + frame images → write `videos/website_objects.jsonl` + `videos/frame_objects.jsonl` |
+| `upload` | Bulk-upload pre-embedded JSONL files into Weaviate |
+| `all` | Run all three phases sequentially |
+| `websites` | Website text only (embed + upload inline) |
 
 ### 2.1 Install data pipeline dependencies
 
@@ -158,16 +169,14 @@ uv pip install -r data/requirements.txt
 WEAVIATE_ENDPOINT=http://localhost:8080
 WEAVIATE_GRPC_PORT=50051
 WEAVIATE_API_KEY=<your-weaviate-api-key>
-WEAVIATE_COLLECTION_WEBSITE=StarLearnersWebsite
-WEAVIATE_COLLECTION_FRAME=StarLearnersFrame
+WEAVIATE_COLLECTION=StarLearnersKB
 
 # Vertex AI — used for embeddings and captioning (ADC, no API key needed)
 GCP_PROJECT=tridorian-sg-vertex-ai
 GCP_LOCATION=us-central1
 
-# Model overrides (optional)
-GEMINI_TEXT_EMBED_MODEL=gemini-embedding-001
-GEMINI_IMAGE_EMBED_MODEL=multimodalembedding@001
+# Model overrides (optional — these are the defaults)
+GEMINI_EMBED_MODEL=gemini-embedding-2-preview
 GEMINI_CAPTION_MODEL=gemini-2.5-flash
 ```
 
@@ -180,20 +189,21 @@ gcloud auth application-default login
 ### 2.3 Run ingestion (port-forward must be active)
 
 ```bash
-# Full ingest — websites + YouTube frames
+# Full ingest — extract frames → embed everything → upload to Weaviate
 python data/build_weaviate_index.py --mode all --recreate-collection
 
 # Website text only
 python data/build_weaviate_index.py --mode websites
 
-# YouTube frames only
-python data/build_weaviate_index.py --mode youtube
-
-# Two-phase YouTube ingest (recommended for large videos):
-# Phase 1 — extract + caption + embed frames to local JSONL (resumable)
+# Run phases independently (recommended for large videos):
+# Phase 1 — extract JPEG frames to disk (fast, no API calls)
 python data/build_weaviate_index.py --mode extract-frames
-# Phase 2 — upload pre-extracted JSONL to Weaviate
-python data/build_weaviate_index.py --mode upload-frames
+
+# Phase 2 — caption + embed website + frames, write JSONL files
+python data/build_weaviate_index.py --mode embed
+
+# Phase 3 — upload JSONL files to Weaviate (requires port-forward)
+python data/build_weaviate_index.py --mode upload --recreate-collection
 ```
 
 > Ingestion is idempotent — reruns upsert using deterministic `doc_id` hashes without duplicating data.
@@ -225,12 +235,10 @@ DEMO_AGENT_MODEL=gemini-live-2.5-flash-native-audio
 WEAVIATE_ENDPOINT=http://localhost:8080
 WEAVIATE_GRPC_PORT=50051
 WEAVIATE_API_KEY=<your-weaviate-api-key>
-WEAVIATE_COLLECTION_WEBSITE=StarLearnersWebsite
-WEAVIATE_COLLECTION_FRAME=StarLearnersFrame
+WEAVIATE_COLLECTION=StarLearnersKB
 
-# Embedding models — must match what was used during ingestion
-GEMINI_TEXT_EMBED_MODEL=gemini-embedding-001
-GEMINI_IMAGE_EMBED_MODEL=multimodalembedding@001
+# Embedding model — must match what was used during ingestion
+GEMINI_EMBED_MODEL=gemini-embedding-2-preview
 ```
 
 ---
@@ -241,10 +249,10 @@ Make sure the port-forward from Step 1.2 is active, then:
 
 ```bash
 cd app
-uvicorn main:app --host 127.0.0.1 --port 8080
+uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-Open `http://127.0.0.1:8080` to start a voice conversation with Stella.
+Open `http://127.0.0.1:8000` to start a voice conversation with Stella.
 
 **Available endpoints:**
 
@@ -284,21 +292,7 @@ This will:
 1. Build the Docker image from `app/Dockerfile`
 2. Push to `gcr.io/$PROJECT_ID/star-learners-bidi-agent`
 3. Deploy to Cloud Run with VPC egress into `weaviate-vpc`
-4. Grant IAP access to `@tridorian.com` users via:
-   ```yaml
-   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-     entrypoint: gcloud
-     args:
-       - iap
-       - web
-       - add-iam-policy-binding
-       - --member="domain:tridorian.com"
-       - --role="roles/iap.httpsResourceAccessor"
-       - --region=us-central1
-       - --resource-type=cloud-run
-       - --service=star-learners-bidi-agent
-   ```
-   This ensures only users with `@tridorian.com` Google accounts can access the deployed app. The service is deployed with `--no-allow-unauthenticated` so all unauthenticated requests are rejected at the Cloud Run level.
+4. Grant IAP access to `@tridorian.com` users — only authenticated Google accounts under that domain can access the deployed app
 
 ---
 
@@ -317,10 +311,8 @@ This will:
 | `WEAVIATE_ENDPOINT` | No | `http://localhost:8080` | Weaviate HTTP endpoint |
 | `WEAVIATE_GRPC_PORT` | No | `50051` | Weaviate gRPC port |
 | `WEAVIATE_API_KEY` | No | — | Weaviate API key |
-| `WEAVIATE_COLLECTION_WEBSITE` | No | `StarLearnersWebsite` | Website chunks collection |
-| `WEAVIATE_COLLECTION_FRAME` | No | `StarLearnersFrame` | Video frames collection |
-| `GEMINI_TEXT_EMBED_MODEL` | No | `gemini-embedding-001` | Text embedding model |
-| `GEMINI_IMAGE_EMBED_MODEL` | No | `multimodalembedding@001` | Image embedding model |
+| `WEAVIATE_COLLECTION` | No | `StarLearnersKB` | Unified knowledge base collection |
+| `GEMINI_EMBED_MODEL` | No | `gemini-embedding-2-preview` | Embedding model (text + images) |
 
 ### Data Pipeline (`data/.env`)
 
@@ -329,12 +321,10 @@ This will:
 | `WEAVIATE_ENDPOINT` | Yes | — | Weaviate HTTP endpoint |
 | `WEAVIATE_GRPC_PORT` | No | `50051` | Weaviate gRPC port |
 | `WEAVIATE_API_KEY` | No | — | Weaviate API key |
-| `WEAVIATE_COLLECTION_WEBSITE` | No | `StarLearnersWebsite` | Website chunks collection |
-| `WEAVIATE_COLLECTION_FRAME` | No | `StarLearnersFrame` | Video frames collection |
+| `WEAVIATE_COLLECTION` | No | `StarLearnersKB` | Unified knowledge base collection |
 | `GCP_PROJECT` | Yes | — | GCP project ID (Vertex AI embeddings) |
 | `GCP_LOCATION` | No | `us-central1` | GCP region |
-| `GEMINI_TEXT_EMBED_MODEL` | No | `gemini-embedding-001` | Text embedding model |
-| `GEMINI_IMAGE_EMBED_MODEL` | No | `multimodalembedding@001` | Frame embedding model |
+| `GEMINI_EMBED_MODEL` | No | `gemini-embedding-2-preview` | Embedding model (text + images) |
 | `GEMINI_CAPTION_MODEL` | No | `gemini-2.5-flash` | Frame captioning model |
 
 ---

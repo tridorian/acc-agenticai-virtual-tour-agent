@@ -44,7 +44,7 @@ load_dotenv()
 # Force Vertex AI Mode for the GenAI SDK
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
 PROJECT_ID = os.environ["GOOGLE_CLOUD_PROJECT"]   # KeyError on startup if not set
-LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")  # Must match corpus region
+LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 
 # Initialize Vertex AI
 vertexai.init(project=PROJECT_ID, location=LOCATION)

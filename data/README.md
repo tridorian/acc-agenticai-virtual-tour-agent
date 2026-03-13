@@ -1,17 +1,21 @@
 # Weaviate + Gemini Data Pipeline
 
-This folder contains the data ingestion and retrieval pipeline for:
-- Star Learners website ingestion (text chunks → `StarLearnersWebsite` collection)
-- YouTube demo video ingestion (timestamped frames → `StarLearnersFrame` collection)
-- Querying Weaviate for website answers and tour/demo timestamps
+This folder contains the data ingestion and retrieval pipeline for Star Learners:
+- Website text chunks → `StarLearnersKB` collection (`source_type=website`)
+- YouTube tour video frames → `StarLearnersKB` collection (`source_type=youtube_frame`)
+
+Both are stored in a single unified Weaviate collection using `gemini-embedding-2-preview` (3072-dim vectors) for text and image embeddings.
 
 ## Files
 
-- `build_weaviate_index.py`: ingest websites + YouTube into Weaviate
-- `query_weaviate.py`: search and return top results with YouTube deeplinks
-- `sources.yaml`: exact URLs and YouTube source URL
-- `requirements.txt`: Python dependencies for this pipeline
-- `.env`: environment variables (copy from below)
+- `build_weaviate_index.py` — 3-phase ETL pipeline: extract frames → embed → upload to Weaviate
+- `query_weaviate.py` — CLI tool to search and return top results with YouTube deeplinks
+- `sources.yaml` — website URLs and YouTube source URL
+- `requirements.txt` — Python dependencies
+- `.env` — environment variables (see below)
+- `videos/frames/` — extracted JPEG frames per video (`{video_id}/frame_NNNN.jpg` + `index.jsonl`)
+- `videos/website_objects.jsonl` — embedded website objects ready for upload
+- `videos/frame_objects.jsonl` — embedded frame objects ready for upload
 
 ## Infrastructure
 
@@ -69,47 +73,42 @@ Create `data/.env` with:
 WEAVIATE_ENDPOINT=http://localhost:8080
 WEAVIATE_GRPC_PORT=50051
 WEAVIATE_API_KEY=<your-weaviate-api-key>
-WEAVIATE_COLLECTION_WEBSITE=StarLearnersWebsite
-WEAVIATE_COLLECTION_FRAME=StarLearnersFrame
+WEAVIATE_COLLECTION=StarLearnersKB
 
-# Vertex AI (used for embeddings and captioning — no GOOGLE_API_KEY needed)
+# Vertex AI (used for embeddings and captioning — ADC, no API key needed)
 GCP_PROJECT=tridorian-sg-vertex-ai
 GCP_LOCATION=us-central1
 
-# Model overrides (optional)
-GEMINI_TEXT_EMBED_MODEL=gemini-embedding-001
-GEMINI_IMAGE_EMBED_MODEL=multimodalembedding@001
+# Model overrides (optional — these are the defaults)
+GEMINI_EMBED_MODEL=gemini-embedding-2-preview
 GEMINI_CAPTION_MODEL=gemini-2.5-flash
 ```
 
-> **Note:** Embeddings and captioning use Vertex AI credentials (ADC via `gcloud auth application-default login`). No `GOOGLE_API_KEY` is required.
+> Embeddings and captioning use Vertex AI ADC credentials. Run `gcloud auth application-default login` if not already authenticated.
 
-Make sure ADC is set up:
-
-```bash
-gcloud auth application-default login
-```
-
-## Ingestion Commands
+## Pipeline Modes
 
 Run from the **repo root** with port-forward active:
 
+| Mode | Description |
+|---|---|
+| `all` | Run all three phases sequentially |
+| `extract-frames` | Download video → extract JPEG frames → write `index.jsonl` (no API calls) |
+| `embed` | Embed website text + frames → write `videos/website_objects.jsonl` + `videos/frame_objects.jsonl` |
+| `upload` | Upload pre-embedded JSONL files to Weaviate |
+| `websites` | Website text only (embed + upload inline) |
+
 ```bash
-# Full ingest (websites + YouTube frames)
+# Full ingest (all phases at once)
 python data/build_weaviate_index.py --mode all --recreate-collection
 
 # Website text only
 python data/build_weaviate_index.py --mode websites
 
-# YouTube frames only (downloads, captions, embeds, uploads)
-python data/build_weaviate_index.py --mode youtube
-
-# Two-phase YouTube ingest:
-# Phase 1 — extract frames + captions + embeddings to local JSONL (slow, resumable)
+# Run phases independently:
 python data/build_weaviate_index.py --mode extract-frames
-
-# Phase 2 — upload pre-extracted JSONL to Weaviate (fast)
-python data/build_weaviate_index.py --mode upload-frames
+python data/build_weaviate_index.py --mode embed
+python data/build_weaviate_index.py --mode upload --recreate-collection
 ```
 
 Optional flags:
@@ -120,8 +119,9 @@ python data/build_weaviate_index.py \
   --frame-interval-sec 5 \
   --batch-size 32 \
   --recreate-collection \
-  --frames-dir data/frames \
-  --frames-index data/frames/frames_index.jsonl
+  --frames-base-dir videos/frames \
+  --website-objects videos/website_objects.jsonl \
+  --frame-objects videos/frame_objects.jsonl
 ```
 
 ## Query Commands
@@ -132,21 +132,15 @@ python data/query_weaviate.py --query "infant care programme" --top-k 5 --source
 python data/query_weaviate.py --query "show the tour video" --top-k 5 --source-type youtube
 ```
 
-Output format:
-- `query`
-- `results[]` with fields:
-  - `score` (1 - cosine_distance)
-  - `source_type` (`website_chunk` or `youtube_frame`)
-  - `content_preview`
-  - `url`
-  - `video_id`
-  - `timestamp_sec`
-  - `timestamp_hms`
-  - `youtube_deeplink`
+Output fields per result:
+- `score` (1 - cosine_distance)
+- `source_type` (`website` or `youtube_frame`)
+- `content_preview`
+- `url`
+- `video_id`, `timestamp_sec`, `timestamp_hms`, `youtube_deeplink` (frames only)
 
 ## Notes
 
-- `build_weaviate_index.py` uses deterministic `doc_id` UUID hashes, so reruns upsert without creating duplicates.
-- Script is resilient to per-item failures and prints a final JSON summary.
-- YouTube query path uses `multimodalembedding@001` text→image-space embedding. Falls back gracefully if unavailable.
+- `build_weaviate_index.py` uses deterministic `doc_id` UUID hashes — reruns upsert without duplicates.
+- Splitting into phases is useful for large videos: `extract-frames` is fast (no API calls), `embed` is slow (one API call per frame), `upload` is fast and can be retried independently if Weaviate is unavailable.
 - For Cloud Run deployment, set `WEAVIATE_ENDPOINT=http://10.10.0.3:8080` (internal LB, reachable via VPC egress).
