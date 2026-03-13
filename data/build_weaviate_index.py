@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Build a Weaviate index from Star Learners website pages and a YouTube demo video.
 
-This script ingests:
-- website text chunks -> Gemini text embeddings -> Weaviate StarLearnersWebsite collection
-- YouTube frames (every N seconds) -> Gemini frame captions + image embeddings -> Weaviate StarLearnersFrame collection
+Pipeline modes:
+  extract-frames  Download video → extract JPEG frames → write per-video index.jsonl (no embedding)
+  embed           Embed website text + frame captions → write JSONL object files
+  upload          Bulk upload JSONL object files to Weaviate StarLearnersKB collection
+  all             Run extract-frames → embed → upload sequentially
+  websites        Extract + embed + upload website text only (no video)
 """
 
 from __future__ import annotations
@@ -14,7 +17,6 @@ import json
 import logging
 import os
 import re
-import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -25,28 +27,24 @@ from urllib.parse import urlparse
 
 import cv2
 import requests
-import vertexai
 import yaml
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from vertexai.vision_models import Image as VertexImage
-from vertexai.vision_models import MultiModalEmbeddingModel
 from yt_dlp import YoutubeDL
 
 LOGGER = logging.getLogger("build_weaviate_index")
 USER_AGENT = "Mozilla/5.0 (StarLearners-Weaviate-Ingestor)"
 
-DEFAULT_WEBSITE_COLLECTION = "StarLearnersWebsite"
-DEFAULT_FRAME_COLLECTION = "StarLearnersFrame"
+DEFAULT_COLLECTION = "StarLearnersKB"
 DEFAULT_FRAME_INTERVAL_SEC = 5
 DEFAULT_BATCH_SIZE = 32
-DEFAULT_TEXT_EMBED_MODEL = "gemini-embedding-001"
-DEFAULT_IMAGE_EMBED_MODEL = "gemini-embedding-001"
-DEFAULT_CAPTION_MODEL = "gemini-2.0-flash"
-DEFAULT_FRAMES_DIR = "data/frames"
-DEFAULT_FRAMES_INDEX = "data/frames/frames_index.jsonl"
+DEFAULT_EMBED_MODEL = "gemini-embedding-2-preview"
+DEFAULT_CAPTION_MODEL = "gemini-2.5-flash"
+DEFAULT_FRAMES_BASE_DIR = "videos/frames"
+DEFAULT_WEBSITE_OBJECTS = "videos/website_objects.jsonl"
+DEFAULT_FRAME_OBJECTS = "videos/frame_objects.jsonl"
 
 
 @dataclass
@@ -54,47 +52,47 @@ class ScriptConfig:
     mode: str
     sources_path: Path
     frame_interval_sec: int
-    website_collection: str
-    frame_collection: str
+    collection: str
     recreate_collection: bool
     batch_size: int
-    frames_dir: Path
-    frames_index: Path
+    frames_base_dir: Path
+    website_objects_path: Path
+    frame_objects_path: Path
 
 
 def parse_args() -> ScriptConfig:
     parser = argparse.ArgumentParser(description="Build Weaviate index from websites and YouTube frames")
     parser.add_argument(
         "--mode",
-        choices=["all", "websites", "youtube", "extract-frames", "upload-frames"],
+        choices=["all", "websites", "extract-frames", "embed", "upload"],
         default="all",
         help=(
-            "all: websites+youtube end-to-end | "
-            "websites: ingest website text only | "
-            "youtube: download+embed+upload video frames | "
-            "extract-frames: extract frames+captions+embeddings to local JSONL | "
-            "upload-frames: bulk-upload pre-extracted frames JSONL to Weaviate"
+            "all: extract-frames → embed → upload end-to-end | "
+            "websites: website text only (embed + upload inline) | "
+            "extract-frames: download video and extract JPEG frames to disk | "
+            "embed: embed website text + frame images → write JSONL object files | "
+            "upload: bulk-upload pre-embedded JSONL files to Weaviate"
         ),
     )
     parser.add_argument("--sources", default="data/sources.yaml")
     parser.add_argument("--frame-interval-sec", type=int, default=DEFAULT_FRAME_INTERVAL_SEC)
-    parser.add_argument("--website-collection", default=os.getenv("WEAVIATE_COLLECTION_WEBSITE", DEFAULT_WEBSITE_COLLECTION))
-    parser.add_argument("--frame-collection", default=os.getenv("WEAVIATE_COLLECTION_FRAME", DEFAULT_FRAME_COLLECTION))
+    parser.add_argument("--collection", default=os.getenv("WEAVIATE_COLLECTION", DEFAULT_COLLECTION))
     parser.add_argument("--recreate-collection", action="store_true")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--frames-dir", default=DEFAULT_FRAMES_DIR, help="Directory to save extracted frames")
-    parser.add_argument("--frames-index", default=DEFAULT_FRAMES_INDEX, help="JSONL file for frame metadata+embeddings")
+    parser.add_argument("--frames-base-dir", default=DEFAULT_FRAMES_BASE_DIR)
+    parser.add_argument("--website-objects", default=DEFAULT_WEBSITE_OBJECTS)
+    parser.add_argument("--frame-objects", default=DEFAULT_FRAME_OBJECTS)
     args = parser.parse_args()
     return ScriptConfig(
         mode=args.mode,
         sources_path=Path(args.sources),
         frame_interval_sec=max(1, args.frame_interval_sec),
-        website_collection=args.website_collection,
-        frame_collection=args.frame_collection,
+        collection=args.collection,
         recreate_collection=args.recreate_collection,
         batch_size=max(1, args.batch_size),
-        frames_dir=Path(args.frames_dir),
-        frames_index=Path(args.frames_index),
+        frames_base_dir=Path(args.frames_base_dir),
+        website_objects_path=Path(args.website_objects),
+        frame_objects_path=Path(args.frame_objects),
     )
 
 
@@ -143,21 +141,32 @@ def to_hms(seconds: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> List[str]:
+def chunk_text(text: str, max_chars: int = 800, overlap_chars: int = 120) -> List[str]:
+    """Split text into chunks at sentence boundaries to avoid cutting words mid-word."""
     normalized = re.sub(r"\s+", " ", text).strip()
     if not normalized:
         return []
-
+    sentences = re.split(r"(?<=[.!?])\s+", normalized)
     chunks: List[str] = []
-    start = 0
-    while start < len(normalized):
-        end = min(len(normalized), start + chunk_size)
-        piece = normalized[start:end].strip()
-        if piece:
-            chunks.append(piece)
-        if end == len(normalized):
-            break
-        start = max(0, end - overlap)
+    current: List[str] = []
+    current_len = 0
+    for sent in sentences:
+        if current_len + len(sent) + 1 > max_chars and current:
+            chunks.append(" ".join(current))
+            # Overlap: keep trailing sentences that fit within overlap_chars
+            overlap: List[str] = []
+            overlap_len = 0
+            for s in reversed(current):
+                if overlap_len + len(s) + 1 <= overlap_chars:
+                    overlap.insert(0, s)
+                    overlap_len += len(s) + 1
+                else:
+                    break
+            current, current_len = overlap[:], overlap_len
+        current.append(sent)
+        current_len += len(sent) + 1
+    if current:
+        chunks.append(" ".join(current))
     return chunks
 
 
@@ -187,24 +196,14 @@ def extract_readable_text(html: str) -> Tuple[str, str]:
         title = soup.title.string.strip()
 
     body = soup.body if soup.body else soup
-    text = body.get_text("\n", strip=True)
-    text = re.sub(r"\n{2,}", "\n", text)
+    text = body.get_text(separator=" ", strip=True)
+    text = re.sub(r" {2,}", " ", text)
     return title, text
 
 
-_http_session: Optional[requests.Session] = None
-
-
-def _get_http_session() -> requests.Session:
-    global _http_session
-    if _http_session is None:
-        _http_session = requests.Session()
-        _http_session.headers.update({"User-Agent": USER_AGENT})
-    return _http_session
-
-
 def fetch_url(url: str, attempts: int = 3, timeout: int = 20) -> str:
-    session = _get_http_session()
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
     last_error: Optional[Exception] = None
     for attempt in range(1, attempts + 1):
         try:
@@ -212,7 +211,7 @@ def fetch_url(url: str, attempts: int = 3, timeout: int = 20) -> str:
             response.raise_for_status()
             response.encoding = response.encoding or "utf-8"
             return response.text
-        except Exception as exc:  # noqa: BLE001
+        except requests.RequestException as exc:
             last_error = exc
             sleep_s = min(2 * attempt, 6)
             LOGGER.warning("Fetch failed (%s/%s) for %s: %s", attempt, attempts, url, exc)
@@ -225,7 +224,7 @@ def with_retry(fn, attempts: int = 3, base_sleep: float = 1.0):
     for attempt in range(1, attempts + 1):
         try:
             return fn()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_error = exc
             delay = base_sleep * (2 ** (attempt - 1))
             LOGGER.warning("Operation failed (%s/%s): %s", attempt, attempts, exc)
@@ -234,73 +233,51 @@ def with_retry(fn, attempts: int = 3, base_sleep: float = 1.0):
 
 
 class GeminiEmbedder:
+    """Handles all text and image embeddings via gemini-embedding-2-preview."""
+
     def __init__(self) -> None:
         gcp_project = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
         gcp_location = os.getenv("GCP_LOCATION", "us-central1")
         if not gcp_project:
             raise RuntimeError("Missing GCP_PROJECT / GOOGLE_CLOUD_PROJECT env var")
-        vertexai.init(project=gcp_project, location=gcp_location)
         self.client = genai.Client(vertexai=True, project=gcp_project, location=gcp_location)
-        self.text_embed_model = os.getenv("GEMINI_TEXT_EMBED_MODEL", DEFAULT_TEXT_EMBED_MODEL)
-        self.image_embed_model = os.getenv("GEMINI_IMAGE_EMBED_MODEL", DEFAULT_IMAGE_EMBED_MODEL)
+        self.embed_model = os.getenv("GEMINI_EMBED_MODEL", DEFAULT_EMBED_MODEL)
         self.caption_model = os.getenv("GEMINI_CAPTION_MODEL", DEFAULT_CAPTION_MODEL)
-
-        self._vertex_image_model: Optional[MultiModalEmbeddingModel] = None
-        if "multimodalembedding" in self.image_embed_model:
-            self._vertex_image_model = MultiModalEmbeddingModel.from_pretrained(self.image_embed_model)
-            LOGGER.info("Vertex AI multimodal embedding model loaded: %s", self.image_embed_model)
 
     @staticmethod
     def _extract_vectors(response: Any) -> List[List[float]]:
         embeddings = getattr(response, "embeddings", None)
-        if embeddings is None and isinstance(response, dict):
-            embeddings = response.get("embeddings")
         if not embeddings:
             raise ValueError("Embedding response has no embeddings")
-
         vectors: List[List[float]] = []
         for item in embeddings:
             values = getattr(item, "values", None)
-            if values is None and isinstance(item, dict):
-                values = item.get("values")
             if not values:
                 raise ValueError("Embedding item has no values")
             vectors.append(list(values))
         return vectors
 
     def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        def _call() -> Any:
-            return self.client.models.embed_content(
-                model=self.text_embed_model,
-                contents=texts,
-                config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"),
-            )
-
-        response = with_retry(_call)
-        return self._extract_vectors(response)
-
-    def embed_single_text(self, text: str) -> List[float]:
-        return self.embed_texts([text])[0]
+        # gemini-embedding-2-preview returns one embedding per call — call once per text.
+        vectors: List[List[float]] = []
+        for text in texts:
+            def _call(t: str = text) -> Any:
+                return self.client.models.embed_content(
+                    model=self.embed_model,
+                    contents=[t],
+                )
+            response = with_retry(_call)
+            vectors.append(self._extract_vectors(response)[0])
+        return vectors
 
     def embed_image(self, image_bytes: bytes, mime_type: str = "image/jpeg") -> List[float]:
-        if self._vertex_image_model is not None:
-            vertex_image = VertexImage(image_bytes=image_bytes)
-
-            def _vertex_call() -> Any:
-                return self._vertex_image_model.get_embeddings(image=vertex_image)
-
-            result = with_retry(_vertex_call)
-            return list(result.image_embedding)
-
         part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
 
         def _call() -> Any:
             return self.client.models.embed_content(
-                model=self.image_embed_model,
+                model=self.embed_model,
                 contents=[part],
-                config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"),
             )
-
         response = with_retry(_call)
         return self._extract_vectors(response)[0]
 
@@ -316,12 +293,10 @@ class GeminiEmbedder:
                 model=self.caption_model,
                 contents=[prompt, part],
             )
-
         response = with_retry(_call)
         text = getattr(response, "text", None)
         if text:
             return text.strip()
-
         candidates = getattr(response, "candidates", None) or []
         for cand in candidates:
             content = getattr(cand, "content", None)
@@ -336,10 +311,11 @@ class GeminiEmbedder:
 
 
 class WeaviateStore:
-    def __init__(self, website_collection: str, frame_collection: str, recreate_collection: bool) -> None:
+    """Single unified StarLearnersKB collection storing both website and frame objects."""
+
+    def __init__(self, collection: str, recreate_collection: bool) -> None:
         import weaviate
         from weaviate.classes.config import Configure, DataType, Property, VectorDistances
-        
         from weaviate.connect import ConnectionParams
 
         endpoint = require_env("WEAVIATE_ENDPOINT")
@@ -365,81 +341,49 @@ class WeaviateStore:
             auth_client_secret=auth,
         )
         self.client.connect()
+        self.collection_name = collection
 
-        self.website_collection = website_collection
-        self.frame_collection = frame_collection
-
-        website_props = [
+        # Unified schema: source_type distinguishes website vs youtube_frame objects
+        properties = [
             Property(name="doc_id", data_type=DataType.TEXT),
             Property(name="source_type", data_type=DataType.TEXT),
             Property(name="source_url", data_type=DataType.TEXT),
             Property(name="title", data_type=DataType.TEXT),
             Property(name="content", data_type=DataType.TEXT),
             Property(name="chunk_index", data_type=DataType.INT),
-            Property(name="created_at", data_type=DataType.TEXT),
-        ]
-        frame_props = [
-            Property(name="doc_id", data_type=DataType.TEXT),
-            Property(name="source_type", data_type=DataType.TEXT),
-            Property(name="source_url", data_type=DataType.TEXT),
-            Property(name="title", data_type=DataType.TEXT),
-            Property(name="content", data_type=DataType.TEXT),
             Property(name="video_id", data_type=DataType.TEXT),
             Property(name="timestamp_sec", data_type=DataType.INT),
             Property(name="timestamp_hms", data_type=DataType.TEXT),
             Property(name="created_at", data_type=DataType.TEXT),
         ]
-
         vector_index = Configure.VectorIndex.hnsw(distance_metric=VectorDistances.COSINE)
 
-        self._ensure_collection(
-            website_collection, website_props, vector_index, recreate_collection, Configure
-        )
-        self._ensure_collection(
-            frame_collection, frame_props, vector_index, recreate_collection, Configure
-        )
-
-    def _ensure_collection(self, name: str, properties, vector_index, recreate: bool, Configure) -> None:
-        exists = self.client.collections.exists(name)
-        if exists and recreate:
-            LOGGER.info("Recreating collection: %s", name)
-            self.client.collections.delete(name)
+        exists = self.client.collections.exists(collection)
+        if exists and recreate_collection:
+            LOGGER.info("Recreating collection: %s", collection)
+            self.client.collections.delete(collection)
             exists = False
-
         if not exists:
-            LOGGER.info("Creating collection: %s", name)
+            LOGGER.info("Creating collection: %s", collection)
             self.client.collections.create(
-                name=name,
+                name=collection,
                 vectorizer_config=Configure.Vectorizer.none(),
                 vector_index_config=vector_index,
                 properties=properties,
             )
 
-    def upsert_website_objects(self, objects: List[Dict[str, Any]]) -> None:
+    def upsert_objects(self, objects: List[Dict[str, Any]], batch_size: int) -> None:
         if not objects:
             return
-        collection = self.client.collections.get(self.website_collection)
-        with collection.batch.fixed_size(batch_size=100) as batch:
+        collection = self.client.collections.get(self.collection_name)
+        with collection.batch.fixed_size(batch_size=batch_size) as batch:
             for obj in objects:
                 batch.add_object(
                     properties=obj["properties"],
                     uuid=obj["doc_id"],
                     vector=obj["vector"],
                 )
-        LOGGER.info("Upserted %d website objects", len(objects))
-
-    def upsert_frame_objects(self, objects: List[Dict[str, Any]]) -> None:
-        if not objects:
-            return
-        collection = self.client.collections.get(self.frame_collection)
-        with collection.batch.fixed_size(batch_size=100) as batch:
-            for obj in objects:
-                batch.add_object(
-                    properties=obj["properties"],
-                    uuid=obj["doc_id"],
-                    vector=obj["vector"],
-                )
-        LOGGER.info("Upserted %d frame objects", len(objects))
+        LOGGER.info("Upserted %d objects into %s", len(objects), self.collection_name)
 
     def close(self) -> None:
         self.client.close()
@@ -450,62 +394,9 @@ def iter_batches(items: List[Any], batch_size: int) -> Iterable[List[Any]]:
         yield items[i : i + batch_size]
 
 
-def build_website_objects(
-    websites: List[str],
-    embedder: GeminiEmbedder,
-    failures: List[Dict[str, str]],
-    batch_size: int,
-) -> List[Dict[str, Any]]:
-    records: List[Dict[str, Any]] = []
-
-    for url in websites:
-        try:
-            html = fetch_url(url)
-            title, text = extract_readable_text(html)
-            chunks = chunk_text(text)
-            if not chunks:
-                raise ValueError("No readable content extracted")
-
-            for idx, chunk in enumerate(chunks):
-                doc_id = stable_hash(["website", url, str(idx), chunk])
-                records.append({
-                    "doc_id": doc_id,
-                    "title": title,
-                    "url": url,
-                    "chunk_index": idx,
-                    "content": chunk,
-                })
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("Website ingestion failed for %s", url)
-            failures.append({"source": url, "error": str(exc)})
-
-    objects: List[Dict[str, Any]] = []
-    for batch in iter_batches(records, batch_size):
-        texts = [r["content"] for r in batch]
-        vectors = embedder.embed_texts(texts)
-        if len(vectors) != len(texts):
-            raise RuntimeError(
-                f"Embedding count mismatch: sent {len(texts)} texts, "
-                f"received {len(vectors)} embeddings"
-            )
-
-        for item, vector in zip(batch, vectors):
-            objects.append({
-                "doc_id": item["doc_id"],
-                "vector": vector,
-                "properties": {
-                    "doc_id": item["doc_id"],
-                    "source_type": "website_chunk",
-                    "source_url": item["url"],
-                    "title": item["title"],
-                    "content": item["content"],
-                    "chunk_index": item["chunk_index"],
-                    "created_at": now_iso(),
-                },
-            })
-
-    return objects
-
+# ---------------------------------------------------------------------------
+# Phase 1 — extract-frames
+# ---------------------------------------------------------------------------
 
 def download_youtube_video(youtube_url: str, out_dir: Path) -> Tuple[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -516,7 +407,6 @@ def download_youtube_video(youtube_url: str, out_dir: Path) -> Tuple[str, Path]:
         "format": "mp4/best[ext=mp4]/best",
         "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
     }
-
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(youtube_url, download=True)
         video_id = info.get("id")
@@ -532,8 +422,25 @@ def download_youtube_video(youtube_url: str, out_dir: Path) -> Tuple[str, Path]:
         return video_id, local_path
 
 
-def extract_frames(video_path: Path, frame_interval_sec: int, out_dir: Path) -> List[Tuple[int, Path]]:
-    out_dir.mkdir(parents=True, exist_ok=True)
+def extract_and_save_frames(
+    youtube_url: str,
+    frame_interval_sec: int,
+    frames_base_dir: Path,
+    failures: List[Dict[str, str]],
+    local_video: Optional[Path] = None,
+) -> Tuple[str, Path]:
+    """Phase 1: Extract frames from video and write index.jsonl. Returns (video_id, index_path)."""
+    if local_video and local_video.exists():
+        LOGGER.info("Using local video file: %s", local_video)
+        video_id = extract_video_id_from_url(youtube_url) or local_video.stem[:64]
+        video_path = local_video
+    else:
+        dl_dir = frames_base_dir / "_download"
+        video_id, video_path = download_youtube_video(youtube_url, dl_dir)
+
+    frames_dir = frames_base_dir / video_id
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -542,180 +449,195 @@ def extract_frames(video_path: Path, frame_interval_sec: int, out_dir: Path) -> 
     if not fps or fps <= 0:
         fps = 25.0
 
-    frames: List[Tuple[int, Path]] = []
+    index_path = frames_dir / "index.jsonl"
+    saved = 0
     next_ts = 0
     frame_index = 0
 
     try:
-        while True:
-            ok, frame = capture.read()
-            if not ok:
-                break
-
-            current_sec = int(frame_index / fps)
-            if current_sec >= next_ts:
-                frame_path = out_dir / f"frame_{current_sec:06d}.jpg"
-                cv2.imwrite(str(frame_path), frame)
-                frames.append((current_sec, frame_path))
-                next_ts += frame_interval_sec
-            frame_index += 1
+        with index_path.open("w", encoding="utf-8") as idx_fh:
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                current_sec = int(frame_index / fps)
+                if current_sec >= next_ts:
+                    frame_n = saved + 1
+                    frame_path = frames_dir / f"frame_{frame_n:04d}.jpg"
+                    cv2.imwrite(str(frame_path), frame)
+                    record = {
+                        "frame_n": frame_n,
+                        "timestamp_sec": current_sec,
+                        "timestamp_hms": to_hms(current_sec),
+                        "jpg_path": str(frame_path),
+                    }
+                    idx_fh.write(json.dumps(record) + "\n")
+                    saved += 1
+                    next_ts += frame_interval_sec
+                frame_index += 1
     finally:
         capture.release()
 
-    return frames
+    LOGGER.info("Extracted %d frames for video %s → %s", saved, video_id, index_path)
+    return video_id, index_path
 
 
-def build_youtube_objects(
-    youtube_url: str,
-    frame_interval_sec: int,
+# ---------------------------------------------------------------------------
+# Phase 2 — embed
+# ---------------------------------------------------------------------------
+
+def embed_website_objects(
+    websites: List[str],
     embedder: GeminiEmbedder,
+    output_path: Path,
+    batch_size: int,
     failures: List[Dict[str, str]],
-    local_video: Optional[Path] = None,
-) -> List[Dict[str, Any]]:
-    with tempfile.TemporaryDirectory(prefix="yt_ingest_") as tmp:
-        tmp_path = Path(tmp)
-        if local_video and local_video.exists():
-            LOGGER.info("Using local video file: %s", local_video)
-            video_id = extract_video_id_from_url(youtube_url) or local_video.stem[:64]
-            video_path = local_video
-        else:
-            video_id, video_path = download_youtube_video(youtube_url, tmp_path / "video")
-        frame_items = extract_frames(video_path, frame_interval_sec, tmp_path / "frames")
+) -> int:
+    """Embed website text chunks and write Weaviate-ready objects to JSONL. Returns count written."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    records = []
+    for url in websites:
+        try:
+            html = fetch_url(url)
+            title, text = extract_readable_text(html)
+            chunks = chunk_text(text)
+            if not chunks:
+                raise ValueError("No readable content extracted")
+            for idx, chunk in enumerate(chunks):
+                doc_id = stable_hash(["website", url, str(idx), chunk])
+                records.append({
+                    "doc_id": doc_id,
+                    "title": title,
+                    "url": url,
+                    "chunk_index": idx,
+                    "content": chunk,
+                })
+        except Exception as exc:
+            LOGGER.exception("Website ingestion failed for %s", url)
+            failures.append({"source": url, "error": str(exc)})
 
-        objects: List[Dict[str, Any]] = []
-        for timestamp_sec, frame_path in frame_items:
+    written = 0
+    with output_path.open("w", encoding="utf-8") as fh:
+        for batch in iter_batches(records, batch_size):
+            texts = [r["content"] for r in batch]
+            vectors = embedder.embed_texts(texts)
+            if len(vectors) != len(texts):
+                raise RuntimeError(
+                    f"Embedding count mismatch: sent {len(texts)}, received {len(vectors)}"
+                )
+            for item, vector in zip(batch, vectors):
+                obj = {
+                    "doc_id": item["doc_id"],
+                    "vector": vector,
+                    "properties": {
+                        "doc_id": item["doc_id"],
+                        "source_type": "website",
+                        "source_url": item["url"],
+                        "title": item["title"],
+                        "content": item["content"],
+                        "chunk_index": item["chunk_index"],
+                        "created_at": now_iso(),
+                    },
+                }
+                fh.write(json.dumps(obj) + "\n")
+                written += 1
+
+    LOGGER.info("Wrote %d website objects to %s", written, output_path)
+    return written
+
+
+def embed_frame_objects(
+    youtube_url: str,
+    video_id: str,
+    index_path: Path,
+    embedder: GeminiEmbedder,
+    output_path: Path,
+    failures: List[Dict[str, str]],
+) -> int:
+    """Caption + embed frames from index.jsonl and write Weaviate-ready objects. Returns count written."""
+    if not index_path.exists():
+        raise FileNotFoundError(f"Frame index not found: {index_path}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    frame_records = []
+    with index_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                frame_records.append(json.loads(line))
+
+    LOGGER.info("Embedding %d frames from %s", len(frame_records), index_path)
+    written = 0
+    with output_path.open("w", encoding="utf-8") as fh:
+        for fr in frame_records:
             try:
-                image_bytes = frame_path.read_bytes()
-                caption = embedder.caption_image(image_bytes, mime_type="image/jpeg")
-                image_vector = embedder.embed_image(image_bytes, mime_type="image/jpeg")
-
-                doc_id = stable_hash(["youtube", video_id, str(timestamp_sec)])
-                objects.append({
+                jpg_path = Path(fr["jpg_path"])
+                image_bytes = jpg_path.read_bytes()
+                caption = embedder.caption_image(image_bytes)
+                image_vector = embedder.embed_image(image_bytes)
+                doc_id = stable_hash(["youtube", video_id, str(fr["timestamp_sec"])])
+                obj = {
                     "doc_id": doc_id,
                     "vector": image_vector,
                     "properties": {
                         "doc_id": doc_id,
                         "source_type": "youtube_frame",
                         "source_url": youtube_url,
-                        "title": f"YouTube frame at {to_hms(timestamp_sec)}",
+                        "title": f"YouTube frame at {fr['timestamp_hms']}",
                         "content": caption,
                         "video_id": video_id,
-                        "timestamp_sec": timestamp_sec,
-                        "timestamp_hms": to_hms(timestamp_sec),
+                        "timestamp_sec": fr["timestamp_sec"],
+                        "timestamp_hms": fr["timestamp_hms"],
                         "created_at": now_iso(),
                     },
-                })
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.exception("Failed processing frame %s", frame_path)
-                failures.append({"source": str(frame_path), "error": str(exc)})
-
-        return objects
-
-
-def extract_and_save_frames(
-    youtube_url: str,
-    frame_interval_sec: int,
-    embedder: GeminiEmbedder,
-    frames_dir: Path,
-    frames_index: Path,
-    failures: List[Dict[str, str]],
-    local_video: Optional[Path] = None,
-) -> int:
-    """Extract frames from video, caption + embed each, save to local JSONL. Returns count saved."""
-    frames_dir.mkdir(parents=True, exist_ok=True)
-    frames_index.parent.mkdir(parents=True, exist_ok=True)
-
-    _tmp_ctx = None
-    try:
-        if local_video and local_video.exists():
-            LOGGER.info("Using local video file: %s", local_video)
-            video_id = extract_video_id_from_url(youtube_url) or local_video.stem[:64]
-            video_path = local_video
-        else:
-            _tmp_ctx = tempfile.TemporaryDirectory(prefix="yt_ingest_")
-            tmp_path = Path(_tmp_ctx.name)
-            video_id, video_path = download_youtube_video(youtube_url, tmp_path / "video")
-        frame_items = extract_frames(video_path, frame_interval_sec, frames_dir)
-    except Exception:
-        if _tmp_ctx is not None:
-            _tmp_ctx.cleanup()
-        raise
-
-    if frames_index.exists():
-        LOGGER.warning("Frames index already exists: %s — appending to existing file.", frames_index)
-
-    saved = 0
-    open_mode = "a" if frames_index.exists() else "w"
-    with frames_index.open(open_mode, encoding="utf-8") as fh:
-        for timestamp_sec, frame_path in frame_items:
-            try:
-                image_bytes = frame_path.read_bytes()
-                caption = embedder.caption_image(image_bytes, mime_type="image/jpeg")
-                image_vector = embedder.embed_image(image_bytes, mime_type="image/jpeg")
-
-                doc_id = stable_hash(["youtube", video_id, str(timestamp_sec)])
-                record = {
-                    "doc_id": doc_id,
-                    "source_type": "youtube_frame",
-                    "source_url": youtube_url,
-                    "title": f"YouTube frame at {to_hms(timestamp_sec)}",
-                    "content": caption,
-                    "video_id": video_id,
-                    "timestamp_sec": timestamp_sec,
-                    "timestamp_hms": to_hms(timestamp_sec),
-                    "frame_path": str(frame_path),
-                    "image_vector": image_vector,
-                    "created_at": now_iso(),
                 }
-                fh.write(json.dumps(record) + "\n")
+                fh.write(json.dumps(obj) + "\n")
                 fh.flush()
-                saved += 1
-                LOGGER.info("Saved frame %s/%s — %s", saved, len(frame_items), to_hms(timestamp_sec))
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.exception("Failed processing frame %s", frame_path)
-                failures.append({"source": str(frame_path), "error": str(exc)})
+                written += 1
+                LOGGER.info(
+                    "Embedded frame %d/%d at %s", written, len(frame_records), fr["timestamp_hms"]
+                )
+            except Exception as exc:
+                LOGGER.exception("Failed embedding frame %s", fr.get("jpg_path"))
+                failures.append({"source": fr.get("jpg_path", ""), "error": str(exc)})
 
-    if _tmp_ctx is not None:
-        _tmp_ctx.cleanup()
-    LOGGER.info("Frames extracted and saved to %s (%s records)", frames_index, saved)
-    return saved
+    LOGGER.info("Wrote %d frame objects to %s", written, output_path)
+    return written
 
 
-def upload_frames_from_index(
-    frames_index: Path,
+# ---------------------------------------------------------------------------
+# Phase 3 — upload
+# ---------------------------------------------------------------------------
+
+def upload_objects_from_jsonl(
+    jsonl_path: Path,
     store: WeaviateStore,
     batch_size: int,
     failures: List[Dict[str, str]],
 ) -> int:
-    """Read pre-extracted frames JSONL and bulk-upsert to Weaviate. Returns count upserted."""
-    if not frames_index.exists():
-        raise FileNotFoundError(f"Frames index not found: {frames_index}")
+    """Read JSONL of Weaviate objects and bulk-upsert. Returns count upserted."""
+    if not jsonl_path.exists():
+        LOGGER.warning("JSONL file not found, skipping: %s", jsonl_path)
+        return 0
 
-    records = []
-    with frames_index.open("r", encoding="utf-8") as fh:
+    objects: List[Dict[str, Any]] = []
+    with jsonl_path.open("r", encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if line:
-                records.append(json.loads(line))
+                try:
+                    objects.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    LOGGER.warning("Skipping malformed JSONL line: %s", exc)
 
-    LOGGER.info("Loaded %s frame records from %s", len(records), frames_index)
-
-    objects: List[Dict[str, Any]] = []
-    for r in records:
-        try:
-            properties = {k: v for k, v in r.items() if k not in ("image_vector", "frame_path")}
-            objects.append({
-                "doc_id": r["doc_id"],
-                "vector": r["image_vector"],
-                "properties": properties,
-            })
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("Failed building object for %s", r.get("frame_path"))
-            failures.append({"source": r.get("frame_path", ""), "error": str(exc)})
-
-    store.upsert_frame_objects(objects)
+    LOGGER.info("Loaded %d objects from %s", len(objects), jsonl_path)
+    store.upsert_objects(objects, batch_size)
     return len(objects)
 
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     load_dotenv(Path(__file__).parent / ".env")
@@ -724,90 +646,111 @@ def main() -> None:
 
     websites, youtube_url, local_video = load_sources(cfg.sources_path)
     failures: List[Dict[str, str]] = []
+    video_id: Optional[str] = None
+    index_path: Optional[Path] = None
 
-    # extract-frames: only needs embedder, no Weaviate
-    if cfg.mode == "extract-frames":
-        embedder = GeminiEmbedder()
-        saved = extract_and_save_frames(
+    # ---- Phase 1: extract-frames ----
+    if cfg.mode in {"all", "extract-frames"}:
+        LOGGER.info("Phase 1: Extracting frames from %s", youtube_url)
+        video_id, index_path = extract_and_save_frames(
             youtube_url=youtube_url,
             frame_interval_sec=cfg.frame_interval_sec,
-            embedder=embedder,
-            frames_dir=cfg.frames_dir,
-            frames_index=cfg.frames_index,
+            frames_base_dir=cfg.frames_base_dir,
             failures=failures,
             local_video=local_video,
         )
-        print(json.dumps({
-            "mode": cfg.mode,
-            "frames_saved": saved,
-            "frames_index": str(cfg.frames_index),
-            "failures_count": len(failures),
-            "failures": failures,
-        }, indent=2))
-        return
-
-    embedder = GeminiEmbedder()
-    store = WeaviateStore(
-        website_collection=cfg.website_collection,
-        frame_collection=cfg.frame_collection,
-        recreate_collection=cfg.recreate_collection,
-    )
-
-    try:
-        # upload-frames: read pre-extracted JSONL and bulk upsert
-        if cfg.mode == "upload-frames":
-            upserted = upload_frames_from_index(
-                frames_index=cfg.frames_index,
-                store=store,
-                batch_size=cfg.batch_size,
-                failures=failures,
-            )
+        if cfg.mode == "extract-frames":
             print(json.dumps({
                 "mode": cfg.mode,
-                "frames_upserted": upserted,
+                "video_id": video_id,
+                "index_path": str(index_path),
                 "failures_count": len(failures),
                 "failures": failures,
             }, indent=2))
             return
 
-        website_objects: List[Dict[str, Any]] = []
-        youtube_objects: List[Dict[str, Any]] = []
+    # ---- Phase 2: embed ----
+    if cfg.mode in {"all", "embed", "websites"}:
+        embedder = GeminiEmbedder()
 
-        if cfg.mode in {"all", "websites"}:
-            LOGGER.info("Ingesting website sources (%s URLs)", len(websites))
-            website_objects = build_website_objects(
-                websites=websites,
-                embedder=embedder,
-                failures=failures,
-                batch_size=cfg.batch_size,
-            )
-            store.upsert_website_objects(website_objects)
-            LOGGER.info("Upserted website objects: %s", len(website_objects))
+        LOGGER.info("Phase 2: Embedding website text (%d URLs)", len(websites))
+        website_written = embed_website_objects(
+            websites=websites,
+            embedder=embedder,
+            output_path=cfg.website_objects_path,
+            batch_size=cfg.batch_size,
+            failures=failures,
+        )
 
-        if cfg.mode in {"all", "youtube"}:
-            LOGGER.info("Ingesting YouTube source: %s", youtube_url)
-            youtube_objects = build_youtube_objects(
+        frame_written = 0
+        if cfg.mode in {"all", "embed"}:
+            # In standalone embed mode, locate index from a prior extract-frames run
+            if cfg.mode == "embed":
+                index_files = list(cfg.frames_base_dir.glob("*/index.jsonl"))
+                if not index_files:
+                    raise FileNotFoundError(
+                        f"No frame index files found in {cfg.frames_base_dir}. "
+                        "Run --mode extract-frames first."
+                    )
+                if len(index_files) > 1:
+                    LOGGER.warning("Multiple frame indexes found, using: %s", index_files[0])
+                index_path = index_files[0]
+                video_id = index_path.parent.name
+
+            LOGGER.info("Phase 2: Embedding frames for video %s", video_id)
+            frame_written = embed_frame_objects(
                 youtube_url=youtube_url,
-                frame_interval_sec=cfg.frame_interval_sec,
+                video_id=video_id,
+                index_path=index_path,
                 embedder=embedder,
+                output_path=cfg.frame_objects_path,
                 failures=failures,
-                local_video=local_video,
             )
-            store.upsert_frame_objects(youtube_objects)
-            LOGGER.info("Upserted YouTube frame objects: %s", len(youtube_objects))
 
-        summary = {
+        if cfg.mode == "embed":
+            print(json.dumps({
+                "mode": cfg.mode,
+                "website_objects_written": website_written,
+                "frame_objects_written": frame_written,
+                "website_objects_path": str(cfg.website_objects_path),
+                "frame_objects_path": str(cfg.frame_objects_path),
+                "failures_count": len(failures),
+                "failures": failures,
+            }, indent=2))
+            return
+
+    # ---- Phase 3: upload ----
+    if cfg.mode in {"all", "upload", "websites"}:
+        store = WeaviateStore(
+            collection=cfg.collection,
+            recreate_collection=cfg.recreate_collection,
+        )
+        try:
+            website_upserted = upload_objects_from_jsonl(
+                jsonl_path=cfg.website_objects_path,
+                store=store,
+                batch_size=cfg.batch_size,
+                failures=failures,
+            )
+            frame_upserted = 0
+            if cfg.mode in {"all", "upload"}:
+                frame_upserted = upload_objects_from_jsonl(
+                    jsonl_path=cfg.frame_objects_path,
+                    store=store,
+                    batch_size=cfg.batch_size,
+                    failures=failures,
+                )
+        finally:
+            store.close()
+
+        print(json.dumps({
             "mode": cfg.mode,
-            "website_collection": cfg.website_collection,
-            "frame_collection": cfg.frame_collection,
-            "website_objects_upserted": len(website_objects),
-            "youtube_objects_upserted": len(youtube_objects),
+            "collection": cfg.collection,
+            "website_objects_upserted": website_upserted,
+            "frame_objects_upserted": frame_upserted,
             "failures_count": len(failures),
             "failures": failures,
-        }
-        print(json.dumps(summary, indent=2))
-    finally:
-        store.close()
+        }, indent=2))
 
 
 if __name__ == "__main__":

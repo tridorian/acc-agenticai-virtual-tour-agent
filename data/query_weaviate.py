@@ -10,15 +10,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
-import vertexai
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from vertexai.vision_models import MultiModalEmbeddingModel
 
-DEFAULT_TEXT_EMBED_MODEL = "gemini-embedding-001"
-DEFAULT_IMAGE_EMBED_MODEL = "gemini-embedding-001"
-DEFAULT_CAPTION_MODEL = "gemini-2.0-flash"
+DEFAULT_EMBED_MODEL = "gemini-embedding-2-preview"
+DEFAULT_CAPTION_MODEL = "gemini-2.5-flash"
+
 # Keywords that suggest the user wants to see the virtual tour video.
 TOUR_HINT_KEYWORDS = frozenset({"tour", "demo", "show", "watch", "video", "playback", "footage"})
 
@@ -32,12 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--source-type", choices=["youtube", "website"], default=None)
     parser.add_argument(
-        "--website-collection",
-        default=os.getenv("WEAVIATE_COLLECTION_WEBSITE", "StarLearnersWebsite"),
-    )
-    parser.add_argument(
-        "--frame-collection",
-        default=os.getenv("WEAVIATE_COLLECTION_FRAME", "StarLearnersFrame"),
+        "--collection",
+        default=os.getenv("WEAVIATE_COLLECTION", "StarLearnersKB"),
     )
     return parser.parse_args()
 
@@ -61,40 +55,31 @@ class GeminiQuery:
         gcp_location = os.getenv("GCP_LOCATION", "us-central1")
         if not gcp_project:
             raise RuntimeError("Missing GCP_PROJECT / GOOGLE_CLOUD_PROJECT env var")
-        vertexai.init(project=gcp_project, location=gcp_location)
         self.client = genai.Client(vertexai=True, project=gcp_project, location=gcp_location)
-        self.text_embed_model = os.getenv("GEMINI_TEXT_EMBED_MODEL", DEFAULT_TEXT_EMBED_MODEL)
-        self.image_embed_model = os.getenv("GEMINI_IMAGE_EMBED_MODEL", DEFAULT_IMAGE_EMBED_MODEL)
+        self.embed_model = os.getenv("GEMINI_EMBED_MODEL", DEFAULT_EMBED_MODEL)
         self.caption_model = os.getenv("GEMINI_CAPTION_MODEL", DEFAULT_CAPTION_MODEL)
-
-        self._vertex_image_model: Optional[MultiModalEmbeddingModel] = None
-        if "multimodalembedding" in self.image_embed_model:
-            self._vertex_image_model = MultiModalEmbeddingModel.from_pretrained(self.image_embed_model)
 
     @staticmethod
     def _first_vector(response: Any) -> List[float]:
         embeddings = getattr(response, "embeddings", None)
-        if embeddings is None and isinstance(response, dict):
-            embeddings = response.get("embeddings")
         if not embeddings:
             raise ValueError("No embeddings in response")
         first = embeddings[0]
         values = getattr(first, "values", None)
-        if values is None and isinstance(first, dict):
-            values = first.get("values")
         if not values:
             raise ValueError("Embedding vector missing values")
         return list(values)
 
-    def embed_text_query(self, query: str) -> List[float]:
+    def embed_query(self, query: str) -> List[float]:
+        # gemini-embedding-2-preview returns one embedding per call.
         response = self.client.models.embed_content(
-            model=self.text_embed_model,
+            model=self.embed_model,
             contents=[query],
-            config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
         )
         return self._first_vector(response)
 
     def build_visual_bridge_query(self, query: str) -> str:
+        """Rewrite a text query into a visual scene description for better frame matching."""
         response = self.client.models.generate_content(
             model=self.caption_model,
             contents=[
@@ -109,16 +94,13 @@ class GeminiQuery:
             return response.text.strip()
         return query
 
-    def embed_for_image_search(self, query: str) -> Optional[List[float]]:
+    def embed_visual_query(self, query: str) -> Optional[List[float]]:
+        """Build a visual bridge query and embed it for frame search."""
         try:
-            if self._vertex_image_model is not None:
-                result = self._vertex_image_model.get_embeddings(contextual_text=query)
-                return list(result.text_embedding)
             bridge = self.build_visual_bridge_query(query)
             response = self.client.models.embed_content(
-                model=self.image_embed_model,
+                model=self.embed_model,
                 contents=[bridge],
-                config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
             )
             return self._first_vector(response)
         except Exception:
@@ -127,7 +109,6 @@ class GeminiQuery:
 
 def weaviate_client():
     import weaviate
-    
     from weaviate.connect import ConnectionParams
 
     endpoint = require_env("WEAVIATE_ENDPOINT")
@@ -161,13 +142,18 @@ def search_collection(
     collection_name: str,
     vector: List[float],
     limit: int,
+    source_type_filter: Optional[str] = None,
 ) -> List[Any]:
-    from weaviate.classes.query import MetadataQuery
+    from weaviate.classes.query import Filter, MetadataQuery
 
     collection = client.collections.get(collection_name)
+    filters = None
+    if source_type_filter:
+        filters = Filter.by_property("source_type").equal(source_type_filter)
     result = collection.query.near_vector(
         near_vector=vector,
         limit=limit,
+        filters=filters,
         return_metadata=MetadataQuery(distance=True),
     )
     return result.objects
@@ -204,30 +190,31 @@ def main() -> None:
 
     gemini = GeminiQuery()
     client = weaviate_client()
-
     results: List[Dict[str, Any]] = []
 
     try:
         if args.source_type in (None, "website"):
-            text_vec = gemini.embed_text_query(args.query)
+            text_vec = gemini.embed_query(args.query)
             text_hits = search_collection(
                 client=client,
-                collection_name=args.website_collection,
+                collection_name=args.collection,
                 vector=text_vec,
                 limit=args.top_k,
+                source_type_filter="website",
             )
-            results.extend(format_result(hit, "website_chunk") for hit in text_hits)
+            results.extend(format_result(hit, "website") for hit in text_hits)
 
         if args.source_type in (None, "youtube"):
-            image_query_vec = gemini.embed_for_image_search(args.query)
-            if image_query_vec is not None:
-                image_hits = search_collection(
+            visual_vec = gemini.embed_visual_query(args.query)
+            if visual_vec is not None:
+                frame_hits = search_collection(
                     client=client,
-                    collection_name=args.frame_collection,
-                    vector=image_query_vec,
+                    collection_name=args.collection,
+                    vector=visual_vec,
                     limit=args.top_k,
+                    source_type_filter="youtube_frame",
                 )
-                results.extend(format_result(hit, "youtube_frame") for hit in image_hits)
+                results.extend(format_result(hit, "youtube_frame") for hit in frame_hits)
     finally:
         client.close()
 

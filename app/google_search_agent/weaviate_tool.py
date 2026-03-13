@@ -3,9 +3,8 @@
 Provides both a structured search function (used by the API endpoint)
 and a string-returning function tool (used by the ADK agent).
 
-All embeddings use Vertex AI credentials (GCP_PROJECT env var required).
-Text embeddings use gemini-embedding-001 in us-central1.
-Multimodal embeddings use multimodalembedding@001 in us-central1.
+All embeddings use gemini-embedding-2-preview via Vertex AI (GCP_PROJECT env var required).
+Searches the unified StarLearnersKB collection and splits results by source_type.
 """
 from __future__ import annotations
 
@@ -24,19 +23,17 @@ logger = logging.getLogger(__name__)
 # Module-level lazy singletons to avoid re-initializing on every call
 # ---------------------------------------------------------------------------
 _genai_client = None
-_mm_model = None
 _weaviate_client = None
 
 _genai_lock = threading.Lock()
-_mm_lock = threading.Lock()
 _weaviate_lock = threading.Lock()
 
 # Named constants — avoids magic numbers in result truncation
 _TEXT_CONTENT_MAX_CHARS = 600   # Max chars returned per text result
 _VIDEO_CONTENT_MAX_CHARS = 300  # Max chars returned per video frame caption
 
-# Region where gemini-embedding-001 is reliably available
 _EMBED_LOCATION = "us-central1"
+_EMBED_MODEL = "gemini-embedding-2-preview"
 
 # Ensure environment variables are available regardless of process cwd.
 _APP_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
@@ -44,7 +41,7 @@ load_dotenv(_APP_ENV_PATH)
 
 
 def _get_genai_client():
-    """Return a Vertex AI genai client for text embeddings."""
+    """Return a cached Vertex AI genai client for all embeddings."""
     global _genai_client
     if _genai_client is None:
         with _genai_lock:
@@ -61,28 +58,6 @@ def _get_genai_client():
     return _genai_client
 
 
-def _get_mm_model():
-    """Return the cached Vertex AI multimodal embedding model.
-
-    NOTE: multimodalembedding@001 requires us-central1. This function
-    re-initializes the global vertexai state to us-central1 on first call.
-    This is safe because it only runs once (singleton) and the process-wide
-    vertexai location is us-central1 for all embedding paths anyway.
-    """
-    global _mm_model
-    if _mm_model is None:
-        with _mm_lock:
-            if _mm_model is None:
-                import vertexai
-                from vertexai.vision_models import MultiModalEmbeddingModel
-                gcp_project = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
-                if not gcp_project:
-                    raise RuntimeError("Missing GCP_PROJECT / GOOGLE_CLOUD_PROJECT env var")
-                vertexai.init(project=gcp_project, location="us-central1")
-                _mm_model = MultiModalEmbeddingModel.from_pretrained("multimodalembedding@001")
-    return _mm_model
-
-
 def _get_weaviate_client():
     """Return a lazy singleton Weaviate v4 client."""
     global _weaviate_client
@@ -90,7 +65,6 @@ def _get_weaviate_client():
         with _weaviate_lock:
             if _weaviate_client is None:
                 import weaviate
-                
                 from weaviate.connect import ConnectionParams
 
                 endpoint = os.getenv("WEAVIATE_ENDPOINT", "http://localhost:8080")
@@ -134,38 +108,42 @@ def close_weaviate_client() -> None:
 def search_weaviate(query: str, top_k: int = 3) -> Dict[str, Any]:
     """Search Weaviate for both website text and YouTube video frames.
 
+    Embeds the query with gemini-embedding-2-preview, then runs two filtered
+    near_vector queries against the unified StarLearnersKB collection — one for
+    website chunks and one for youtube_frame objects.
+
     Returns a structured dict suitable for both the REST endpoint and the agent tool.
     """
     from google.genai import types
-    from weaviate.classes.query import MetadataQuery
+    from weaviate.classes.query import Filter, MetadataQuery
 
-    website_collection = os.getenv("WEAVIATE_COLLECTION_WEBSITE", "StarLearnersWebsite")
-    frame_collection = os.getenv("WEAVIATE_COLLECTION_FRAME", "StarLearnersFrame")
+    collection_name = os.getenv("WEAVIATE_COLLECTION", "StarLearnersKB")
+    embed_model = os.getenv("GEMINI_EMBED_MODEL", _EMBED_MODEL)
     logger.info("Weaviate search | query=%r", query[:80])
 
     genai_client = _get_genai_client()
     weaviate_client = _get_weaviate_client()
 
-    # --- Text / website search ---
+    # Embed query once — gemini-embedding-2-preview handles both text and image search
+    embed_response = genai_client.models.embed_content(
+        model=embed_model,
+        contents=[query],
+    )
+    query_vec = list(embed_response.embeddings[0].values)
+
+    collection = weaviate_client.collections.get(collection_name)
+
+    # --- Website text results ---
     text_results: List[Dict[str, Any]] = []
     try:
-        text_response = genai_client.models.embed_content(
-            model=os.getenv("GEMINI_TEXT_EMBED_MODEL", "gemini-embedding-001"),
-            contents=[query],
-            config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
-        )
-        text_vec = list(text_response.embeddings[0].values)
-
-        collection = weaviate_client.collections.get(website_collection)
         result = collection.query.near_vector(
-            near_vector=text_vec,
+            near_vector=query_vec,
             limit=top_k,
+            filters=Filter.by_property("source_type").equal("website"),
             return_metadata=MetadataQuery(distance=True),
         )
-
         for obj in result.objects:
             props = obj.properties
-            # Convert distance to similarity score (lower distance = more similar)
             distance = obj.metadata.distance
             score = (1.0 - distance) if distance is not None else 0.0
             text_results.append({
@@ -175,22 +153,17 @@ def search_weaviate(query: str, top_k: int = 3) -> Dict[str, Any]:
             })
         logger.info("Text search returned %d hits", len(text_results))
     except Exception as exc:
-        logger.error("Text embedding/search failed: %s", exc, exc_info=True)
+        logger.error("Text search failed: %s", exc, exc_info=True)
 
-    # --- Image / video frame search ---
+    # --- Video frame results ---
     video_results: List[Dict[str, Any]] = []
     try:
-        mm_model = _get_mm_model()
-        image_embed = mm_model.get_embeddings(contextual_text=query)
-        image_vec = list(image_embed.text_embedding)
-
-        collection = weaviate_client.collections.get(frame_collection)
         result = collection.query.near_vector(
-            near_vector=image_vec,
+            near_vector=query_vec,
             limit=top_k,
+            filters=Filter.by_property("source_type").equal("youtube_frame"),
             return_metadata=MetadataQuery(distance=True),
         )
-
         for obj in result.objects:
             props = obj.properties
             distance = obj.metadata.distance
@@ -208,9 +181,9 @@ def search_weaviate(query: str, top_k: int = 3) -> Dict[str, Any]:
                 "timestamp_hms": str(props.get("timestamp_hms", "")),
                 "youtube_deeplink": deeplink,
             })
-        logger.info("Image search returned %d hits", len(video_results))
+        logger.info("Video search returned %d hits", len(video_results))
     except Exception as exc:
-        logger.error("Image embedding/search failed: %s", exc, exc_info=True)
+        logger.error("Video search failed: %s", exc, exc_info=True)
 
     return {"text_results": text_results, "video_results": video_results}
 
